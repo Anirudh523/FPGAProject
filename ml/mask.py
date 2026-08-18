@@ -1,12 +1,18 @@
 """
-Step 1: Sanity-check that you can correctly decode a Supervisely bitmap
-annotation and overlay it on the source image.
+Batch-convert Supervisely bitmap annotations into cached 4x4
+grid classification labels.
+
+For each image:
+  1. Decode all object masks
+  2. Paint them onto one full-size label canvas (by class, using priority
+     order to resolve overlaps)
+  3. Downsample that canvas into a 4x4 grid using presence-based labeling
+     (any pixels of a class in a cell -> that cell gets that class)
+  4. Save the resulting 4x4 label array as a .npy file, and log a CSV
+     mapping image path -> label path
 
 Usage:
-    python verify_mask.py <path_to_image.jpg> <path_to_annotation.json>
-
-This does NOT build the dataset yet -- it just proves the decode logic
-is correct on one example before you trust it across the whole dataset.
+    python mask.py <img_dir> <ann_dir> <output_dir>
 """
 
 import sys
@@ -19,13 +25,14 @@ import os
 
 import numpy as np
 from PIL import Image
-import matplotlib.pyplot as plt
 
 GRID_SIZE = 4
 
+# Class priority: LAST in this list wins when a cell has multiple classes.
 CLASS_PRIORITY = ["road", "cracks", "pothole"]
 
 BACKGROUND_LABEL = "background"
+
 
 def decode_supervisely_bitmap(bitmap_data_b64: str) -> np.ndarray:
     """
@@ -38,8 +45,6 @@ def decode_supervisely_bitmap(bitmap_data_b64: str) -> np.ndarray:
     mask_img = Image.open(io.BytesIO(png_bytes))
     mask_arr = np.array(mask_img)
 
-    # Supervisely bitmaps are typically single-channel or RGBA where alpha
-    # (or the single channel) indicates the mask. Handle both cases.
     if mask_arr.ndim == 3:
         if mask_arr.shape[2] == 4:
             mask = mask_arr[:, :, 3] > 0
@@ -68,7 +73,13 @@ def place_mask_on_canvas(mask: np.ndarray, origin: list, canvas_h: int, canvas_w
     canvas[y_off:y_end, x_off:x_end] = mask[:mask_h_clip, :mask_w_clip]
     return canvas
 
+
 def build_label_canvas(ann: dict, canvas_h: int, canvas_w: int) -> np.ndarray:
+    """
+    Returns an (H, W) integer array where each pixel holds the index into
+    CLASS_PRIORITY of the class present at that pixel (or -1 for background).
+    Higher-priority classes overwrite lower-priority ones where they overlap.
+    """
     label_canvas = np.full((canvas_h, canvas_w), -1, dtype=np.int8)
 
     for obj in ann["objects"]:
@@ -81,21 +92,31 @@ def build_label_canvas(ann: dict, canvas_h: int, canvas_w: int) -> np.ndarray:
 
         class_idx = CLASS_PRIORITY.index(class_title)
         mask = decode_supervisely_bitmap(obj["bitmap"]["data"])
-        full_mask = place_mask_on_canvas(mask, obj[""])
+        full_mask = place_mask_on_canvas(mask, obj["bitmap"]["origin"], canvas_h, canvas_w)
+
+        # Only overwrite where this class has HIGHER (or equal) priority
+        # than whatever's already painted there
+        overwrite = full_mask & (class_idx >= label_canvas)
+        label_canvas[overwrite] = class_idx
+
     return label_canvas
 
 
 def downsample_to_grid(label_canvas: np.ndarray, grid_size: int) -> np.ndarray:
-    h,w = label_canvas.shape
-    cell_h = h
-    cell_w = w
+    """
+    Presence-based downsampling: for each grid cell, pick the HIGHEST
+    priority class present anywhere in that cell (-1 = background).
+    """
+    h, w = label_canvas.shape
+    cell_h = h // grid_size
+    cell_w = w // grid_size
 
-    grid_labels = np.full((grid_size, grid_size), - 1, dtype = np.int8)
+    grid_labels = np.full((grid_size, grid_size), -1, dtype=np.int8)
 
     for i in range(grid_size):
         for j in range(grid_size):
-            y0, y1 = i*cell_h, (i+1)*cell_h if i < grid_size -1 else h
-            x0, x1 = j*cell_w, (j+1)*cell_w if j< grid_size - 1 else w
+            y0, y1 = i * cell_h, (i + 1) * cell_h if i < grid_size - 1 else h
+            x0, x1 = j * cell_w, (j + 1) * cell_w if j < grid_size - 1 else w
             cell = label_canvas[y0:y1, x0:x1]
 
             present_classes = cell[cell >= 0]
@@ -103,7 +124,9 @@ def downsample_to_grid(label_canvas: np.ndarray, grid_size: int) -> np.ndarray:
                 grid_labels[i, j] = -1
             else:
                 grid_labels[i, j] = present_classes.max()
+
     return grid_labels
+
 
 def process_dataset(image_dir: str, ann_dir: str, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
@@ -150,7 +173,7 @@ def process_dataset(image_dir: str, ann_dir: str, output_dir: str):
                     print(f"  [{idx+1}/{len(image_files)}] processed...")
 
             except Exception as e:
-                print(f"  [{idx+1}/{len(image_files)}] FAILED {img_filename}: {e}")
+                print(f"  [{idx+1}/{len(image_files)}] FAILED {img_filename}: {type(e).__name__}: {e!r}")
                 n_failed += 1
 
     print(f"\nDone. {n_success} succeeded, {n_failed} failed.")
@@ -158,10 +181,8 @@ def process_dataset(image_dir: str, ann_dir: str, output_dir: str):
     print(f"Grid labels written to: {labels_dir}")
 
 
-
-
 if __name__ == "__main__":
     if len(sys.argv) != 4:
-        print("Usage: python build_grid_labels.py <img_dir> <ann_dir> <output_dir>")
+        print("Usage: python mask.py <img_dir> <ann_dir> <output_dir>")
         sys.exit(1)
     process_dataset(sys.argv[1], sys.argv[2], sys.argv[3])
